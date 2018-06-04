@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS CloudFormation script to launch VPC, Subnets, and Routing Tables
+
+Parameters: 
+  Name: 
+    Description: Name of VPC
+    Type: String
+
+  VpcCidr: 
+    Description: CIDR for VPC
+    Type: String
+
+Resources: 
+  # Create the VPC, or the parent container of all that is networking!
+  Vpc: 
+    Type: AWS::EC2::VPC
+    Properties: 
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      Tags: 
+        - Key: Name
+          Value: !Ref Name
+
+  # Create a couple of public and private subnets
+  PublicSubnetOne: 
+    Type: AWS::EC2::Subnet
+    Properties: 
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 1, 8]]
+      Tags: 
+        - Key: Name
+          Value: !Join ["-", [!Ref Name, !Select [0, !GetAZs ""]]]
+        - Key: AvailabilityZone
+          Value: !Select [0, !GetAZs ""]
+        - Key: Network
+          Value: Public
+
+  # Create and attach an internet gateway to allow traffic into the VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref Name
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create route tables to hold routing rules, one for public services, two for private, one for each private subnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Ref Name
+        - Key: Network
+          Value: Public
+
+  # Create routes in our route tables, one public one to allow traffic from the internet, and a route for each nat gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate route tables with subnets, every subnet needs an association
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+
+  # Log group to handle logs from the ECS launcher lambda
+  LoggingGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/EcsTaskLauncher
+      RetentionInDays: 30
+
+  # Make an ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref Name
+
+  # Make a task definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 1024
+      Memory: 2GB
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt DockerContainerS3IAMRole.Arn
+      TaskRoleArn: !GetAtt DockerContainerS3IAMRole.Arn
+      Family: !Ref Name
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Image: jjshoe/longrunninglambda
+          Name: longrunninglambda
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-group: !Ref LoggingGroup
+              awslogs-stream-prefix: !Ref Name
+
+  # Make an IAM role so the container can access S3
+  DockerContainerS3IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+       AssumeRolePolicyDocument:
+         Version: 2012-10-17
+         Statement:
+           - Effect: Allow
+             Principal:
+               Service:
+                 - ecs.amazonaws.com
+                 - ecs-tasks.amazonaws.com
+             Action:
+               - sts:AssumeRole
+       Policies:
+         - PolicyName: !Join ["-", [!Ref Name, "policy"]]
+           PolicyDocument:
+             Version: 2012-10-17
+             Statement:
+               - Effect: Allow
+                 Action:
+                   - logs:CreateLogStream
+                   - logs:PutLogEvents
+                 Resource:
+                  - !GetAtt LoggingGroup.Arn
+               - Effect: Allow
+                 Action:
+                   - ecr:GetAuthorizationToken
+                 Resource: "*"
+
+  # Make a role that lets lambda call ECS for us
+  LambdaToECS:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaToECS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt DockerContainerS3IAMRole.Arn
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource:
+                  - !Ref ECSTaskDefinition
+                Condition:
+                  ArnEquals:
+                    "ecs:cluster": !GetAtt ECSCluster.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt LoggingGroup.Arn
+
+  # Create a lambda function that will launch ECS task definitions
+  EcsTaskLauncher:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EcsTaskLauncher
+      Code:
+        ZipFile: |
+                 import boto3
+                 import os
+
+                 def lambda_handler(event, context):
+                   print('Starting lambda, request-id: ', context.aws_request_id)
+                   print('ECS Cluster: ', os.environ['ecs_cluster'])
+                   print('ECS Task Definition: ', os.environ['ecs_task_definition'])
+                   print('ECS subnets: ', os.environ['ecs_subnet'])
+
+                   ecs = boto3.client('ecs')
+                   response = ecs.run_task(
+                     cluster=os.environ['ecs_cluster'],
+                     taskDefinition=os.environ['ecs_task_definition'],
+                     launchType='FARGATE',
+                     networkConfiguration={
+                       'awsvpcConfiguration': {
+                         'subnets': [
+                           os.environ['ecs_subnet'],
+                         ],
+                         'assignPublicIp': 'ENABLED'
+                       }
+                     },
+                     count=1
+                   )
+
+                   return "response={}".format(response)
+      Description: Launch an ECS task 
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          ecs_cluster: !Ref ECSCluster
+          ecs_task_definition: !Ref ECSTaskDefinition
+          ecs_subnet: !Ref PublicSubnetOne
+      Role: !GetAtt LambdaToECS.Arn
+      Runtime: python2.7
+      Timeout: 60
+      Tags:
+        - Key: Name
+          Value: !Ref Name 
+
+Outputs: 
+  VpcId: 
+    Description: VPC Details
+    Value: !Ref Vpc
+    Export:
+      Name: !Join ["-", [ !Ref "AWS::StackName", "VpcId"]]
